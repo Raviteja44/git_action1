@@ -15,6 +15,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  workflows: write
 
 jobs:
   get-pr-commits:
@@ -36,17 +37,35 @@ jobs:
         run: |
           echo "Fetching commits for PR #${{ github.event.inputs.pr_number }}"
 
-          # Fetch PR commit SHAs
-          commits=$(gh pr view ${{ github.event.inputs.pr_number }} --json commits --jq '.commits[].oid + " - " + .commits[].messageHeadline')
+          # Fetch PR commit SHAs and messages
+          commits=$(gh pr view ${{ github.event.inputs.pr_number }} --json commits --jq '.commits[] | .oid + "___" + .messageHeadline')
 
           echo "commit_list<<EOF" >> $GITHUB_OUTPUT
           echo "$commits" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+      - name: Add commit list to summary
+        run: |
+          {
+            echo "## Commits in PR #${{ github.event.inputs.pr_number }}"
+            echo ""
+            echo "| SHA | Message |"
+            echo "|-----|---------|"
+            while IFS= read -r line; do
+              sha="${line%%___*}"
+              msg="${line#*___}"
+              echo "| \`$sha\` | $msg |"
+            done <<< "${{ steps.get_commits.outputs.commit_list }}"
+          } >> $GITHUB_STEP_SUMMARY
+
       - name: Display commits
         run: |
           echo "### Commits found in PR #${{ github.event.inputs.pr_number }}:"
-          echo "${{ steps.get_commits.outputs.commit_list }}"
+          while IFS= read -r line; do
+            sha="${line%%___*}"
+            msg="${line#*___}"
+            echo "$sha - $msg"
+          done <<< "${{ steps.get_commits.outputs.commit_list }}"
           echo ""
           echo "ℹ️ Re-run the workflow and fill 'selected_commits' with the SHAs you want to cherry-pick."
 
