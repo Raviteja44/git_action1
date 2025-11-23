@@ -1,0 +1,47 @@
+name: Tag on Dev Merge
+
+on:
+  push:
+    branches:
+      - dev
+
+permissions:
+  contents: write
+
+jobs:
+  create_tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest commit SHA on dev
+        id: commit
+        run: |
+          SHA=$(git rev-parse --verify HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Determine tag name
+        id: tagname
+        run: |
+          # Try to assemble tag from envs or fallback to actor/project/time
+          EMP="${{ github.event.head_commit.author.name || github.actor }}"
+          PROJECT="proj"
+          CODENAME="codenamed"
+          TIME="$(date +'%Y%m%d_%H%M%S')"
+          # If you want, you can parse PR body or commit message to get metadata.
+          TAG="${EMP}_${PROJECT}_${CODENAME}_${TIME}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        env:
+          TAG: ${{ steps.tagname.outputs.tag }}
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git tag -a "$TAG" "$SHA" -m "Promotion tag $TAG for commit $SHA"
+          git push origin "$TAG"
+          echo "Pushed tag: $TAG"

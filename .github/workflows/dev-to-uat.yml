@@ -1,117 +1,101 @@
-name: Selective Promote Dev → UAT
+name: Dev → UAT Promotion (cherry-pick by tag)
 
 on:
   workflow_dispatch:
     inputs:
-      pr_number:
-        description: "PR number that was merged into dev (feature → dev)"
+      tag:
+        description: 'Tag to promote (must exist in repo, e.g. alice_proj_feature_20251123_173012)'
         required: true
         type: string
-      selected_commits:
-        description: "Comma-separated commit SHAs to cherry-pick into UAT (empty = discovery mode)"
+      temp_branch_prefix:
+        description: 'Prefix for temporary branch (default: promote)'
         required: false
+        default: promote
         type: string
 
 permissions:
   contents: write
   pull-requests: write
-  workflows: write
 
 jobs:
-  get-pr-commits:
+  cherry_pick_and_pr:
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    outputs:
-      commit_list: ${{ steps.get_commits.outputs.commit_list }}
-
     steps:
-      - name: Checkout dev
+      - name: Checkout repo (fetch all)
         uses: actions/checkout@v4
         with:
-          ref: dev
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: Fetch commit list for PR
-        id: get_commits
+      - name: Setup git user
         run: |
-          echo "Fetching commits for PR #${{ github.event.inputs.pr_number }}"
-
-          # Fetch PR commit SHAs and messages
-          commits=$(gh pr view ${{ github.event.inputs.pr_number }} --json commits --jq '.commits[] | .oid + "___" + .messageHeadline')
-
-          echo "commit_list<<EOF" >> $GITHUB_OUTPUT
-          echo "$commits" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Add commit list to summary
-        run: |
-          {
-            echo "## Commits in PR #${{ github.event.inputs.pr_number }}"
-            echo ""
-            echo "| SHA | Message |"
-            echo "|-----|---------|"
-            while IFS= read -r line; do
-              sha="${line%%___*}"
-              msg="${line#*___}"
-              echo "| \`$sha\` | $msg |"
-            done <<< "${{ steps.get_commits.outputs.commit_list }}"
-          } >> $GITHUB_STEP_SUMMARY
-
-      - name: Display commits
-        run: |
-          echo "### Commits found in PR #${{ github.event.inputs.pr_number }}:"
-          while IFS= read -r line; do
-            sha="${line%%___*}"
-            msg="${line#*___}"
-            echo "$sha - $msg"
-          done <<< "${{ steps.get_commits.outputs.commit_list }}"
-          echo ""
-          echo "ℹ️ Re-run the workflow and fill 'selected_commits' with the SHAs you want to cherry-pick."
-
-  cherry_pick:
-    needs: get-pr-commits
-    if: ${{ github.event.inputs.selected_commits != '' }}
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-
-    steps:
-      - name: Checkout UAT
-        uses: actions/checkout@v4
-        with:
-          ref: uat
-          fetch-depth: 0
-
-      - name: Configure git
-        run: |
+          git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git config user.name "GitHub Actions"
 
-      - name: Create release branch
-        id: release
+      - name: Resolve tag commit SHA
+        id: rev
         run: |
-          release_branch="release-uat-${{ github.run_id }}"
-          git checkout -b "$release_branch"
-          echo "release_branch=$release_branch" >> $GITHUB_OUTPUT
+          TAG="${{ github.event.inputs.tag }}"
+          if ! git rev-parse --verify "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG not found"; exit 1
+          fi
+          SHA=$(git rev-list -n 1 "$TAG")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Cherry-pick commits
+      - name: Create temp branch from uat
+        id: branch
         run: |
-          echo "Cherry-picking: ${{ github.event.inputs.selected_commits }}"
-          IFS=',' read -ra COMMITS <<< "${{ github.event.inputs.selected_commits }}"
-          for commit in "${COMMITS[@]}"; do
-            echo "Applying $commit..."
-            git cherry-pick "$commit" || exit 1
-          done
+          PREFIX="${{ github.event.inputs.temp_branch_prefix }}"
+          TIMESTAMP=$(date +'%Y%m%d%H%M%S')
+          TB="${PREFIX}/${{ github.actor }}_${TIMESTAMP}"
+          git fetch origin uat
+          git checkout -b "$TB" origin/uat
+          echo "temp_branch=$TB" >> "$GITHUB_OUTPUT"
 
-      - name: Push release branch
+      - name: Cherry-pick the tagged commit onto temp branch
+        id: cp
         run: |
-          git push origin "${{ steps.release.outputs.release_branch }}"
+          SHA=${{ steps.rev.outputs.sha }}
+          TB=${{ steps.branch.outputs.temp_branch }}
+          # Attempt cherry-pick
+          set -e
+          echo "Cherry-picking $SHA onto $TB"
+          if git cherry-pick -x "$SHA"; then
+            echo "cherry_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cherry_ok=false" >> "$GITHUB_OUTPUT"
+            echo "Cherry-pick failed: unresolved conflicts. Please resolve in PR."
+            git status
+            # keep conflicts staged so PR shows them
+          fi
+          echo "cherry_sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Create PR to UAT
+      - name: Push temp branch to origin
         run: |
-          gh pr create \
-            --title "Promote selected commits to UAT" \
-            --body "Commits: ${{ github.event.inputs.selected_commits }}" \
-            --base uat \
-            --head "${{ steps.release.outputs.release_branch }}"
+          TB=${{ steps.branch.outputs.temp_branch }}
+          git push origin HEAD:refs/heads/"$TB"
+
+      - name: Create PR (temp -> uat)
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tempBranch = "${{ steps.branch.outputs.temp_branch }}";
+            const base = "uat";
+            const title = `Promote ${tempBranch} (tag: ${{ github.event.inputs.tag }}) → ${base}`;
+            const body = [
+              `This PR was created by automation to promote tag **${{ github.event.inputs.tag }}**.`,
+              `Cherry-picked commit: ${ {sha: '${{ steps.rev.outputs.sha }}' }.sha }`,
+              '',
+              'If there are conflicts they must be resolved in this PR.'
+            ].join('\n\n');
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              head: tempBranch,
+              base,
+              body
+            });
+            core.setOutput('pr_number', pr.data.number);
+            console.log('Created PR:', pr.data.number);

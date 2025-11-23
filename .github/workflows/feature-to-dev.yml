@@ -1,127 +1,73 @@
-name: Feature branch to Dev
+name: Feature → Dev (create PR)
 
+# Manual trigger so it does NOT run on every push
 on:
-  workflow_dispatch: # Manual trigger only
+  workflow_dispatch:
     inputs:
       feature_branch:
-        description: 'Feature branch to deploy'
+        description: 'Feature branch to promote (e.g. feature/jira-123)'
         required: true
         type: string
-        default: 'feature/'
-      target_branch:
-        description: 'Target branch (usually dev)'
-        required: true
+      employee:
+        description: 'Your name for tag (optional, used later)'
+        required: false
         type: string
-        default: 'dev'
+      project:
+        description: 'Project short name (optional)'
+        required: false
+        type: string
+      code_name:
+        description: 'Code name or short feature name (optional)'
+        required: false
+        type: string
+
+permissions:
+  contents: write     # needed to push branches and tags
+  pull-requests: write
 
 jobs:
-  compare-and-deploy:
+  create_pr:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      actions: read
-    
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        ref: ${{ github.event.inputs.feature_branch }}
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Setup Git
-      run: |
-        git config --global user.name 'github-actions[bot]'
-        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+      - name: Ensure feature branch exists locally
+        run: |
+          git fetch origin ${{ github.event.inputs.feature_branch }}:refs/remotes/origin/${{ github.event.inputs.feature_branch }} || true
+          git checkout --progress --force ${{ github.event.inputs.feature_branch }}
 
-    - name: Validate branches
-      run: |
-        echo "Source branch: ${{ github.event.inputs.feature_branch }}"
-        echo "Target branch: ${{ github.event.inputs.target_branch }}"
-        
-        # Validate that source branch exists
-        git fetch origin ${{ github.event.inputs.feature_branch }}
-        git fetch origin ${{ github.event.inputs.target_branch }}
+      - name: Create PR (feature -> dev)
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const src = core.getInput('feature_branch') || process.env['GITHUB_REF_NAME'] || '${{ github.event.inputs.feature_branch }}';
+            const sourceBranch = src;
+            const destination = 'dev';
+            // Compose PR title & body with tag metadata suggestion
+            const title = `Promote ${sourceBranch} → ${destination}`;
+            const body = [
+              `Automated promotion PR from **${sourceBranch}** to **${destination}**.`,
+              '',
+              `**Suggested tag metadata (use when promoting dev→uat):**`,
+              `employee: ${{ github.event.inputs.employee || github.actor }}`,
+              `project: ${{ github.event.inputs.project || '' }}`,
+              `code_name: ${{ github.event.inputs.code_name || '' }}`,
+              '',
+              `Merge must be approved as per branch protection rules.`
+            ].join('\n');
 
-    - name: Generate diff report
-      id: diff
-      run: |
-        # Create diff report
-        git diff origin/${{ github.event.inputs.target_branch }}...HEAD -- . ':!*.md' ':!*.txt' 2>/dev/null > diff_report.patch || echo "No differences found" > diff_report.patch
-        echo "DIFF REPORT: ${{ github.event.inputs.feature_branch }} → ${{ github.event.inputs.target_branch }}" > diff_summary.md
-        echo "==============================================" >> diff_summary.md
-        git diff --stat origin/${{ github.event.inputs.target_branch }}...HEAD 2>/dev/null >> diff_summary.md || echo "No statistical differences" >> diff_summary.md
-        echo "" >> diff_summary.md
-        echo "Detailed changes:" >> diff_summary.md
-        git diff origin/${{ github.event.inputs.target_branch }}...HEAD -- . ':!*.md' ':!*.txt' 2>/dev/null >> diff_summary.md || echo "No detailed differences found" >> diff_summary.md
-
-        # Get changed files for PR description
-        CHANGED_FILES=$(git diff --name-only origin/${{ github.event.inputs.target_branch }}...HEAD --diff-filter=ACMRT 2>/dev/null | tr '\n' ' ' || echo "")
-        echo "changed_files=$CHANGED_FILES" >> $GITHUB_OUTPUT
-
-    - name: Create Pull Request
-      id: create-pr
-      uses: actions/github-script@v6
-      with:
-        script: |
-          const featureBranch = '${{ github.event.inputs.feature_branch }}';
-          const targetBranch = '${{ github.event.inputs.target_branch }}';
-          const changedFiles = '${{ steps.diff.outputs.changed_files }}';
-          
-          try {
-            // Check if PR already exists
-            const existingPRs = await github.rest.pulls.list({
+            const { data: pr } = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              head: `${context.repo.owner}:${featureBranch}`,
-              base: targetBranch,
-              state: 'open'
+              title,
+              head: sourceBranch,
+              base: destination,
+              body,
+              maintainer_can_modify: true
             });
-            
-            if (existingPRs.data.length > 0) {
-              console.log('PR already exists: ', existingPRs.data[0].html_url);
-              core.setOutput('pr_url', existingPRs.data[0].html_url);
-              core.setOutput('pr_number', existingPRs.data[0].number);
-              return { pr_number: existingPRs.data[0].number, exists: true };
-            }
-            
-            // Create new PR
-            const pr = await github.rest.pulls.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `Deploy ${featureBranch} to ${targetBranch}`,
-              head: featureBranch,
-              base: targetBranch,
-              body: `## Deployment from ${featureBranch} to ${targetBranch}\n\n` +
-                    `### Changed Files:\n${changedFiles}\n\n` +
-                    `### Diff Summary:\n` +
-                    'See attached diff report for detailed changes.\n\n' +
-                    `**Auto-generated by GitHub Actions**`,
-              draft: false
-            });
-            
-            console.log('PR created: ', pr.data.html_url);
-            core.setOutput('pr_url', pr.data.html_url);
-            core.setOutput('pr_number', pr.data.number);
-            return { pr_number: pr.data.number, exists: false };
-          } catch (error) {
-            core.setFailed(`Error creating PR: ${error.message}`);
-            return { pr_number: 0, exists: false, error: error.message };
-          }
-
-    - name: Upload diff report
-      if: steps.create-pr.outputs.pr_number != 0
-      uses: actions/upload-artifact@v4
-      with:
-        name: diff-report-${{ github.sha }}
-        path: |
-          diff_report.patch
-          diff_summary.md
-        retention-days: 30
-
-    - name: Output PR details
-      if: steps.create-pr.outputs.pr_number != 0
-      run: |
-        echo "Pull Request created successfully!"
-        echo "PR URL: ${{ steps.create-pr.outputs.pr_url }}"
-        echo "PR Number: ${{ steps.create-pr.outputs.pr_number }}"
+            core.setOutput('pr_number', pr.number);
+            console.log('PR created:', pr.number);
