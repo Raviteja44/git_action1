@@ -7,41 +7,87 @@ on:
 
 permissions:
   contents: write
+  pull-requests: read
 
 jobs:
   create_tag:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get latest commit SHA on dev
+      # Identify the PR that was merged into dev
+      - name: Find merged PR
+        id: pr
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const commits = await github.rest.repos.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: "dev",
+              per_page: 1
+            });
+
+            const message = commits.data[0].commit.message;
+
+            // Extract PR number from merge commit title
+            const match = message.match(/Merge pull request #(\d+)/);
+            if (!match) {
+              core.setFailed("No PR number found in merge commit.");
+              return;
+            }
+
+            const prNum = match[1];
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNum
+            });
+
+            core.setOutput("body", pr.data.body);
+
+      # Parse employee / project / code_name from PR body
+      - name: Extract metadata
+        id: meta
+        run: |
+          BODY="${{ steps.pr.outputs.body }}"
+
+          EMP=$(echo "$BODY" | grep -i 'employee:' | head -1 | cut -d':' -f2 | xargs)
+          PROJECT=$(echo "$BODY" | grep -i 'project:' | head -1 | cut -d':' -f2 | xargs)
+          CODENAME=$(echo "$BODY" | grep -i 'code_name:' | head -1 | cut -d':' -f2 | xargs)
+
+          # fallback defaults
+          [ -z "$EMP" ] && EMP="${{ github.actor }}"
+          [ -z "$PROJECT" ] && PROJECT="proj"
+          [ -z "$CODENAME" ] && CODENAME="code"
+
+          # sanitize (remove spaces)
+          EMP="${EMP// /_}"
+          PROJECT="${PROJECT// /_}"
+          CODENAME="${CODENAME// /_}"
+
+          TIME=$(date +'%Y%m%d_%H%M%S')
+
+          TAG="${EMP}_${PROJECT}_${CODENAME}_${TIME}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Get latest commit SHA
         id: commit
         run: |
           SHA=$(git rev-parse --verify HEAD)
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Determine tag name
-        id: tagname
-        run: |
-          # Try to assemble tag from envs or fallback to actor/project/time
-          EMP="${{ github.event.head_commit.author.name || github.actor }}"
-          PROJECT="proj"
-          CODENAME="codenamed"
-          TIME="$(date +'%Y%m%d_%H%M%S')"
-          # If you want, you can parse PR body or commit message to get metadata.
-          TAG="${EMP}_${PROJECT}_${CODENAME}_${TIME}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
       - name: Create and push tag
         env:
-          TAG: ${{ steps.tagname.outputs.tag }}
+          TAG: ${{ steps.meta.outputs.tag }}
           SHA: ${{ steps.commit.outputs.sha }}
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git tag -a "$TAG" "$SHA" -m "Promotion tag $TAG for commit $SHA"
           git push origin "$TAG"
-          echo "Pushed tag: $TAG"
