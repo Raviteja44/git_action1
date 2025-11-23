@@ -1,0 +1,91 @@
+name: Selective Promote Dev → UAT
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number that was merged into dev (feature → dev)"
+        required: true
+        type: string
+      selected_commits:
+        description: "Comma-separated commit SHAs to cherry-pick into UAT (leave empty on first run)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  get-pr-commits:
+    runs-on: ubuntu-latest
+    outputs:
+      commit_list: ${{ steps.get_commits.outputs.commit_list }}
+
+    steps:
+      - name: Checkout dev branch
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Get commits from PR
+        id: get_commits
+        run: |
+          echo "Fetching commits for PR #${{ github.event.inputs.pr_number }}"
+          commits=$(gh pr view ${{ github.event.inputs.pr_number }} --json commits --jq '.commits[].oid + " - " + .commits[].messageHeadline' || true)
+          echo "commit_list<<EOF" >> $GITHUB_OUTPUT
+          echo "$commits" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Show commit SHAs and messages
+        run: |
+          echo "### Commits found in PR #${{ github.event.inputs.pr_number }}:"
+          echo "${{ steps.get_commits.outputs.commit_list }}"
+          echo ""
+          echo "ℹ️ Re-run workflow with selected commit SHAs in input 'selected_commits'."
+
+  cherry_pick_to_release:
+    needs: get-pr-commits
+    if: ${{ github.event.inputs.selected_commits != '' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout uat branch
+        uses: actions/checkout@v4
+        with:
+          ref: uat
+          fetch-depth: 0
+
+      - name: Setup git
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+
+      - name: Create release branch
+        id: release
+        run: |
+          release_branch="release-uat-${{ github.run_id }}"
+          git checkout -b "$release_branch"
+          echo "release_branch=$release_branch" >> $GITHUB_OUTPUT
+
+      - name: Cherry-pick commits
+        run: |
+          echo "Cherry-picking commits: ${{ github.event.inputs.selected_commits }}"
+          IFS=',' read -ra COMMITS <<< "${{ github.event.inputs.selected_commits }}"
+          for commit in "${COMMITS[@]}"; do
+            echo "Applying $commit..."
+            git cherry-pick $commit || (echo "Conflict occurred. Resolve manually after PR opens." && git cherry-pick --abort && exit 1)
+          done
+
+      - name: Push release branch
+        run: |
+          git push origin "${{ steps.release.outputs.release_branch }}"
+
+      - name: Create PR to UAT
+        run: |
+          gh pr create \
+            --title "Promote selected changes to UAT" \
+            --body "Cherry-picked commits: ${{ github.event.inputs.selected_commits }}" \
+            --base uat \
+            --head "${{ steps.release.outputs.release_branch }}"
