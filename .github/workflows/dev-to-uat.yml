@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       selected_commits:
-        description: "Comma-separated commit SHAs to cherry-pick into UAT (leave empty on first run)"
+        description: "Comma-separated commit SHAs to cherry-pick into UAT (empty = discovery mode)"
         required: false
         type: string
 
@@ -19,45 +19,52 @@ permissions:
 jobs:
   get-pr-commits:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     outputs:
       commit_list: ${{ steps.get_commits.outputs.commit_list }}
 
     steps:
-      - name: Checkout dev branch
+      - name: Checkout dev
         uses: actions/checkout@v4
         with:
           ref: dev
           fetch-depth: 0
 
-      - name: Get commits from PR
+      - name: Fetch commit list for PR
         id: get_commits
         run: |
           echo "Fetching commits for PR #${{ github.event.inputs.pr_number }}"
-          commits=$(gh pr view ${{ github.event.inputs.pr_number }} --json commits --jq '.commits[].oid + " - " + .commits[].messageHeadline' || true)
+
+          # Fetch PR commit SHAs
+          commits=$(gh pr view ${{ github.event.inputs.pr_number }} --json commits --jq '.commits[].oid + " - " + .commits[].messageHeadline')
+
           echo "commit_list<<EOF" >> $GITHUB_OUTPUT
           echo "$commits" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Show commit SHAs and messages
+      - name: Display commits
         run: |
           echo "### Commits found in PR #${{ github.event.inputs.pr_number }}:"
           echo "${{ steps.get_commits.outputs.commit_list }}"
           echo ""
-          echo "ℹ️ Re-run workflow with selected commit SHAs in input 'selected_commits'."
+          echo "ℹ️ Re-run the workflow and fill 'selected_commits' with the SHAs you want to cherry-pick."
 
-  cherry_pick_to_release:
+  cherry_pick:
     needs: get-pr-commits
     if: ${{ github.event.inputs.selected_commits != '' }}
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
 
     steps:
-      - name: Checkout uat branch
+      - name: Checkout UAT
         uses: actions/checkout@v4
         with:
           ref: uat
           fetch-depth: 0
 
-      - name: Setup git
+      - name: Configure git
         run: |
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
@@ -71,11 +78,11 @@ jobs:
 
       - name: Cherry-pick commits
         run: |
-          echo "Cherry-picking commits: ${{ github.event.inputs.selected_commits }}"
+          echo "Cherry-picking: ${{ github.event.inputs.selected_commits }}"
           IFS=',' read -ra COMMITS <<< "${{ github.event.inputs.selected_commits }}"
           for commit in "${COMMITS[@]}"; do
             echo "Applying $commit..."
-            git cherry-pick $commit || (echo "Conflict occurred. Resolve manually after PR opens." && git cherry-pick --abort && exit 1)
+            git cherry-pick "$commit" || exit 1
           done
 
       - name: Push release branch
@@ -85,7 +92,7 @@ jobs:
       - name: Create PR to UAT
         run: |
           gh pr create \
-            --title "Promote selected changes to UAT" \
-            --body "Cherry-picked commits: ${{ github.event.inputs.selected_commits }}" \
+            --title "Promote selected commits to UAT" \
+            --body "Commits: ${{ github.event.inputs.selected_commits }}" \
             --base uat \
             --head "${{ steps.release.outputs.release_branch }}"
